@@ -8,7 +8,13 @@ import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattServer;
+import android.bluetooth.BluetoothGattServerCallback;
+import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
+import android.bluetooth.le.AdvertiseCallback;
+import android.bluetooth.le.AdvertiseData;
+import android.bluetooth.le.AdvertiseSettings;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -33,14 +39,15 @@ import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.modules.core.RCTNativeAppEventEmitter;
 
 import java.lang.reflect.Method;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 class BleManager extends ReactContextBaseJavaModule {
-
     public static final String LOG_TAG = "ReactNativeBleManager";
     private static final int ENABLE_REQUEST = 539;
 
@@ -63,6 +70,7 @@ class BleManager extends ReactContextBaseJavaModule {
 
     private BluetoothAdapter bluetoothAdapter;
     private BluetoothManager bluetoothManager;
+    private BluetoothGattServer bluetoothGattServer;
     private Context context;
     private ReactApplicationContext reactContext;
     private Callback enableBluetoothCallback;
@@ -70,6 +78,9 @@ class BleManager extends ReactContextBaseJavaModule {
     private BondRequest bondRequest;
     private BondRequest removeBondRequest;
     private boolean forceLegacy;
+    private final AdvertiseCallback advertiseCallback = new AdvertiseCallback() {};
+    private Map<UUID, Map<UUID, Callback>> gattServiceCharacteristicReadCallbacks;
+    private Map<UUID, Map<UUID, Callback>> gattServiceCharacteristicWriteCallbacks;
 
     public ReactApplicationContext getReactContext() {
         return reactContext;
@@ -122,6 +133,75 @@ class BleManager extends ReactContextBaseJavaModule {
             bluetoothManager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
         }
         return bluetoothManager;
+    }
+
+    private BluetoothGattServer getBluetoothGattServer() {
+        if (bluetoothGattServer == null) {
+            bluetoothGattServer = getBluetoothManager().openGattServer(reactContext, new BluetoothGattServerCallback() {
+                @Override
+                public void onCharacteristicReadRequest(BluetoothDevice device, int requestId, int offset, BluetoothGattCharacteristic characteristic) {
+                    super.onCharacteristicReadRequest(device, requestId, offset, characteristic);
+
+                    UUID serviceUUID = characteristic.getService().getUuid();
+                    UUID characteristicUUID = characteristic.getUuid();
+
+                    Callback callback = getGattServiceCharacteristicReadCallbacks(serviceUUID).get(characteristicUUID);
+                    if (callback != null) {
+                        callback.invoke();
+                    }
+
+                    bluetoothGattServer.sendResponse(device, requestId, 0, offset, null);
+                }
+
+                @Override
+                public void onCharacteristicWriteRequest(BluetoothDevice device, int requestId, BluetoothGattCharacteristic characteristic, boolean preparedWrite, boolean responseNeeded, int offset, byte[] value) {
+                    //TODO
+                    super.onCharacteristicWriteRequest(device, requestId, characteristic, preparedWrite, responseNeeded, offset, value);
+
+                    UUID serviceUUID = characteristic.getService().getUuid();
+                    UUID characteristicUUID = characteristic.getUuid();
+
+                    Callback callback = getGattServiceCharacteristicWriteCallbacks(serviceUUID).get(characteristicUUID);
+                    if (callback != null) {
+                        callback.invoke();
+                    }
+
+                    bluetoothGattServer.sendResponse(device, requestId, 0, offset, null);
+                }
+            });
+        }
+
+        return bluetoothGattServer;
+    }
+
+    private Map<UUID, Callback> getGattServiceCharacteristicReadCallbacks(UUID uuid) {
+        if (gattServiceCharacteristicReadCallbacks == null) {
+            gattServiceCharacteristicReadCallbacks = new HashMap<>();
+        }
+
+        Map<UUID, Callback> serviceCallbacks = gattServiceCharacteristicReadCallbacks.get(uuid);
+
+        if (serviceCallbacks == null) {
+            serviceCallbacks = new HashMap<>();
+            gattServiceCharacteristicReadCallbacks.put(uuid, serviceCallbacks);
+        }
+
+        return serviceCallbacks;
+    }
+
+    private Map<UUID, Callback> getGattServiceCharacteristicWriteCallbacks(UUID uuid) {
+        if (gattServiceCharacteristicWriteCallbacks == null) {
+            gattServiceCharacteristicWriteCallbacks = new HashMap<>();
+        }
+
+        Map<UUID, Callback> serviceCallbacks = gattServiceCharacteristicWriteCallbacks.get(uuid);
+
+        if (serviceCallbacks == null) {
+            serviceCallbacks = new HashMap<>();
+            gattServiceCharacteristicWriteCallbacks.put(uuid, serviceCallbacks);
+        }
+
+        return serviceCallbacks;
     }
 
     public void sendEvent(String eventName, @Nullable WritableMap params) {
@@ -771,6 +851,52 @@ class BleManager extends ReactContextBaseJavaModule {
     @ReactMethod
     public void removeListeners(Integer count) {
         // Keep: Required for RN built in Event Emitter Calls.
+    }
+
+    @ReactMethod
+    public void startAdvertising() {
+        AdvertiseSettings settings = new AdvertiseSettings.Builder()
+                .setConnectable(true)
+                .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
+                .build();
+
+        AdvertiseData data = (new AdvertiseData.Builder()).setIncludeDeviceName(true).build();
+
+        getBluetoothAdapter().getBluetoothLeAdvertiser().startAdvertising(settings, data, advertiseCallback);
+    }
+
+    @ReactMethod
+    public void stopAdvertising() {
+        getBluetoothAdapter().getBluetoothLeAdvertiser().stopAdvertising(advertiseCallback);
+    }
+
+    @ReactMethod
+    public void addGattService(
+            UUID uuid,
+            Map<UUID, Callback> characteristicReadCallbacks,
+            Map<UUID, Callback> characteristicWriteCallbacks) {
+
+        getGattServiceCharacteristicReadCallbacks(uuid).putAll(characteristicReadCallbacks);
+        getGattServiceCharacteristicWriteCallbacks(uuid).putAll(characteristicWriteCallbacks);
+
+        getBluetoothGattServer().addService(new BluetoothGattService(uuid, BluetoothGattService.SERVICE_TYPE_PRIMARY));
+    }
+
+    @ReactMethod
+    public void removeGattService(UUID uuid) {
+        if (gattServiceCharacteristicWriteCallbacks != null) {
+            gattServiceCharacteristicReadCallbacks.remove(uuid);
+        }
+        if (gattServiceCharacteristicWriteCallbacks != null) {
+            gattServiceCharacteristicWriteCallbacks.remove(uuid);
+        }
+    }
+
+    @ReactMethod
+    public void removeAllGattServices() {
+        gattServiceCharacteristicReadCallbacks = null;
+        gattServiceCharacteristicWriteCallbacks = null;
+        bluetoothGattServer.close();
     }
 
     @Override
